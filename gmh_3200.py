@@ -5,9 +5,65 @@ import sys
 import re
 import numpy as np
 
-from daemon import SimpleFactory, SerialUSBProtocol
+from daemon import SimpleFactory, SerialUSBProtocol, SimpleProtocol
 from command import Command
 from daemon import catch
+
+
+def value(response):
+    """
+    Return displayed measuring value.
+    """
+
+    def decode_u16(bytea: int, byteb: int) -> int:
+        data = (255 - bytea) << 8
+        data = data | byteb
+        return data
+
+    def decode_u32(inputa: int, inputb: int) -> int:
+        data = (inputa << 16) | inputb
+        return data
+
+    def crop_u32(value: int) -> int:
+        size = sys.getsizeof(value)
+        result = value
+
+        if size > 32:
+            result = value & 0x00000000FFFFFFFF
+        return result
+
+    def to_signed32(value):
+        value = value & 0xFFFFFFFF
+        return (value ^ 0x80000000) - 0x80000000
+
+    if response == "":
+        return "Error: No value read."
+    byte3, byte4 = response[3], response[4]
+    byte6, byte7 = response[6], response[7]
+    u16_integer1 = decode_u16(byte3, byte4)
+    u16_integer2 = decode_u16(byte6, byte7)
+    u32_integer = decode_u32(u16_integer1, u16_integer2)
+
+    float_pos = 0xFF - byte3
+    float_pos = (float_pos >> 3) - 15
+
+    u32_integer = crop_u32(u32_integer & 0x07FFFFFF)
+
+    if (100000000 + 0x2000000) > u32_integer:
+        compare = crop_u32(u32_integer & 0x04000000)
+
+        if 0x04000000 == compare:
+            u32_integer = crop_u32(u32_integer | 0xF8000000)
+
+        u32_integer = crop_u32(u32_integer + 0x02000000)
+    else:
+        error_num = u32_integer - 0x02000000 - 100000000
+        return self.error_msg(error_num)
+
+    i32_integer = to_signed32(u32_integer)
+    temp_value = float(i32_integer) / float(float(10.0) ** float_pos)
+
+    return temp_value
 
 
 class DaemonProtocol(SimpleProtocol):
@@ -42,8 +98,8 @@ class GMHProtocol(SerialUSBProtocol):
         self.name = "hw"
         self.type = "hw"
         self.status_commands = [
-            (254, 0, 61),  # Channel A read request
-            (253, 0, 2),  # Channel B read request
+            b"\xfe\x00\x3d",  # Channel A read request
+            b"\xfd\x00\x02",  # Channel B read request
         ]
         super().__init__(
             obj=obj,
@@ -81,22 +137,30 @@ class GMHProtocol(SerialUSBProtocol):
     @catch
     def update(self):
         if self._debug:
-            print("self.commands", self.commands)
-        # Request the hardware state from the device
-        if len(self.commands):
-            SimpleProtocol.message(self, self.commands[0]["cmd"])
-            if not self.commands[0]["keep"]:
-                self.commands.pop(0)
+            print("----------------------- command queue ----------------------------")
+            for k in self.commands:
+                print(k["cmd"], k["source"], k["status"])
+            print("===================== command queue end ==========================")
+
+        if len(self.commands) and obj["hw_connected"]:
+            self.message(self.commands[0]["cmd"])
         else:
             for k in self.status_commands:
-                self.commands.append({"cmd": k, "source": "itself", "keep": True})
+                self.commands.append({"cmd": k, "source": "itself", "status": "status"})
 
-    @catch
-    def message(self, string, keep=False, source="itself"):
-        """
-        Send the message to the controller. If keep=True, expect reply
-        """
-        self.commands.append({"cmd": string, "source": source, "keep": keep})
+    def processBinary(self, bstring):
+        # Process the device reply
+        self._bs = bstring
+        result = value(self._bs)
+        if self._debug:
+            print("hw bb > %s" % self._bs)
+            print(f"{result=}")
+        match self._bs[0]:
+            case 254:
+                self.object["temperatureA"] = result
+            case 253:
+                self.object["temperatureB"] = result
+        self.commands.pop(0)
 
 
 if __name__ == "__main__":
@@ -149,13 +213,12 @@ if __name__ == "__main__":
     # Factories for daemon and hardware connections
     # We need two different factories as the protocols are different
     daemon = SimpleFactory(DaemonProtocol, obj)
-    proto = GMHProtocol(serial_num=options.serial_num, obj=obj, debug=options.debug)
 
     daemon.name = options.name
-
     obj["daemon"] = daemon
-    obj["hw"] = proto
 
+    proto = GMHProtocol(serial_num=options.serial_num, obj=obj, debug=options.debug)
+    obj["hw"] = proto
     if options.debug:
         daemon._protocol._debug = True
 
