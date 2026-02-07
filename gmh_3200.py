@@ -131,7 +131,7 @@ class GMHProtocol(SerialUSBProtocol):
 
     @catch
     def processMessage(self, string):
-        logger.debug("hw cc > %s" % string)
+        logger.debug(f"hw cc > {string}")
         self.commands.pop(0)
 
     @catch
@@ -140,7 +140,7 @@ class GMHProtocol(SerialUSBProtocol):
             "----------------------- command queue ----------------------------"
         )
         for k in self.commands:
-            logger.debug(k["cmd"], k["source"], k["status"])
+            logger.debug(f"{k["cmd"]}, {k["source"]}, {k["status"]}")
         logger.debug(
             "===================== command queue end =========================="
         )
@@ -153,20 +153,15 @@ class GMHProtocol(SerialUSBProtocol):
 
     def processBinary(self, bstring):
         # Process the device reply
-
-        logger.debug("hw bb > %s" % self._bs)
-
-        self.commands.pop(0)
         self._bs = bstring
-        result = self.temp_decode(self._bs)
-
-        logger.debug(f"{result=}")
-
-        ch = self._bs[0] - 254
+        logger.debug(f"hw bb > {self._bs}")
+        ch = 254 - self._bs[0] 
         if ch < self.n_channels:
+            result = self.temp_decode(self._bs)
+            logger.debug(f"{ch=} {result=}")
             self.object[f"temperature{ch}"] = result
             self.object["status"] = "ok"
-
+        self.commands.pop(0)
 
 if __name__ == "__main__":
     from optparse import OptionParser
