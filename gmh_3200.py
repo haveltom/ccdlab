@@ -4,10 +4,14 @@ import os
 import sys
 import re
 import numpy as np
+import struct
+import logging
 
 from daemon import SimpleFactory, SerialUSBProtocol, SimpleProtocol
 from command import Command
 from daemon import catch
+
+logger = logging.getLogger(__name__)
 
 
 def value(response):
@@ -87,8 +91,20 @@ class DaemonProtocol(SimpleProtocol):
             )
 
 
+class GMHException(Exception):
+    pass
+
+
 class GMHProtocol(SerialUSBProtocol):
     _binary_length = 9
+    ERROR_CODES = {
+        16352: "Measuring range overrun",
+        16353: "Measuring range underrun",
+        16362: "Calculation not possible",
+        16363: "System error",
+        16364: "Battery empty",
+        16365: "Sensor defective",
+    }
 
     @catch
     def __init__(self, serial_num, obj, debug=False):
@@ -114,6 +130,42 @@ class GMHProtocol(SerialUSBProtocol):
         )
 
     @catch
+    def temp_decode(self, response: bytes) -> float:
+        b3, b4, b6, b7 = struct.unpack_from(">BBxBBx", response, 3)
+
+        high_word = ((~b3 & 0xFF) << 8) | b4
+        low_word = ((~b6 & 0xFF) << 8) | b7
+
+        u32 = (high_word << 16) | low_word
+
+        exponent = ((~b3 & 0xFF) >> 3) - 15
+
+        payload = u32 & 0x07FFFFFF
+
+        if payload >= 125554432:
+            error_code = payload - 0x02000000 - 100000000
+            msg = self.ERROR_CODES.get(error_code, "Unknown hardware error")
+            raise GMHException(msg)
+
+        if payload & 0x04000000:
+            payload -= 0x08000000
+
+        value = (payload + 0x02000000) / (10**exponent)
+        return value
+
+    @catch
+    def crc(self, byte1: int, byte2: int) -> int:
+        ui_hilf = (byte1 << 8) + byte2
+
+        for _ in range(16):
+            if ui_hilf & 0x8000:
+                ui_hilf = ((ui_hilf << 1) ^ 0x700) & 0xFFFF
+            else:
+                ui_hilf = (ui_hilf << 1) & 0xFFFF
+
+        return (~(ui_hilf >> 8)) & 0xFF
+
+    @catch
     def connectionMade(self):
         self.commands = []
         super().connectionMade()
@@ -129,9 +181,7 @@ class GMHProtocol(SerialUSBProtocol):
 
     @catch
     def processMessage(self, string):
-        # Process the device reply
-        if self._debug:
-            print("hw cc > %s" % string)
+        logger.debug("hw cc > %s" % string)
         self.commands.pop(0)
 
     @catch
@@ -151,7 +201,7 @@ class GMHProtocol(SerialUSBProtocol):
     def processBinary(self, bstring):
         # Process the device reply
         self._bs = bstring
-        result = value(self._bs)
+        result = self.temp_decode(self._bs)
         if self._debug:
             print("hw bb > %s" % self._bs)
             print(f"{result=}")
