@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-
+"""
+Allows for communication with GMH 3200 series thermometers and possibly other easyBus instruments.
+Sensor value decoding inspired by https://github.com/rgieseke/pyEasybus/tree/main.
+@author: Tomas Havel
+@contact: haveltom@pm.me
+"""
 import os
 import sys
 import re
