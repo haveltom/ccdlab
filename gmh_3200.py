@@ -14,62 +14,6 @@ from daemon import catch
 logger = logging.getLogger(__name__)
 
 
-def value(response):
-    """
-    Return displayed measuring value.
-    """
-
-    def decode_u16(bytea: int, byteb: int) -> int:
-        data = (255 - bytea) << 8
-        data = data | byteb
-        return data
-
-    def decode_u32(inputa: int, inputb: int) -> int:
-        data = (inputa << 16) | inputb
-        return data
-
-    def crop_u32(value: int) -> int:
-        size = sys.getsizeof(value)
-        result = value
-
-        if size > 32:
-            result = value & 0x00000000FFFFFFFF
-        return result
-
-    def to_signed32(value):
-        value = value & 0xFFFFFFFF
-        return (value ^ 0x80000000) - 0x80000000
-
-    if response == "":
-        return "Error: No value read."
-    byte3, byte4 = response[3], response[4]
-    byte6, byte7 = response[6], response[7]
-    u16_integer1 = decode_u16(byte3, byte4)
-    u16_integer2 = decode_u16(byte6, byte7)
-    u32_integer = decode_u32(u16_integer1, u16_integer2)
-
-    float_pos = 0xFF - byte3
-    float_pos = (float_pos >> 3) - 15
-
-    u32_integer = crop_u32(u32_integer & 0x07FFFFFF)
-
-    if (100000000 + 0x2000000) > u32_integer:
-        compare = crop_u32(u32_integer & 0x04000000)
-
-        if 0x04000000 == compare:
-            u32_integer = crop_u32(u32_integer | 0xF8000000)
-
-        u32_integer = crop_u32(u32_integer + 0x02000000)
-    else:
-        error_num = u32_integer - 0x02000000 - 100000000
-        return self.error_msg(error_num)
-
-    i32_integer = to_signed32(u32_integer)
-    temp_value = float(i32_integer) / float(float(10.0) ** float_pos)
-
-    return temp_value
-
-
 class DaemonProtocol(SimpleProtocol):
     _debug = False  # Display all traffic for debug purposes
     _simulator = False
@@ -81,14 +25,12 @@ class DaemonProtocol(SimpleProtocol):
         if cmd is None:
             return
 
-        obj = self.object  # Object holding the state
-        hw = obj["hw"]  # HW factory
-        string = string.strip()
-        STRING = string.upper()
+        hw = obj["hw"]
         if cmd.name == "get_status":
-            self.message(
-                f'status hw_connected={self.object["hw_connected"]} status={self.object["status"]} temperatureA={self.object["temperatureA"]} temperatureB={self.object["temperatureB"]}'
-            )
+            msg = f'status hw_connected={self.object["hw_connected"]} status={self.object["status"]}'
+            for i in range(self.object["n_channels"]):
+                msg += f' temperature{i}={self.object[f"temperature{i}"]}'
+            self.message(msg)
 
 
 class GMHException(Exception):
@@ -113,9 +55,10 @@ class GMHProtocol(SerialUSBProtocol):
         )  # Queue of command sent to the device which will provide replies, each entry is a dict with keys "cmd","source"
         self.name = "hw"
         self.type = "hw"
+        self.n_channels = obj["n_channels"]
         self.status_commands = [
-            b"\xfe\x00\x3d",  # Channel A read request
-            b"\xfd\x00\x02",  # Channel B read request
+            (254 - x).to_bytes() + b"\x00" + self.crc(254 - x, 0).to_bytes()
+            for x in range(self.n_channels)
         ]
         super().__init__(
             obj=obj,
@@ -145,6 +88,7 @@ class GMHProtocol(SerialUSBProtocol):
         if payload >= 125554432:
             error_code = payload - 0x02000000 - 100000000
             msg = self.ERROR_CODES.get(error_code, "Unknown hardware error")
+            self.object["status"] = msg
             raise GMHException(msg)
 
         if payload & 0x04000000:
@@ -170,14 +114,15 @@ class GMHProtocol(SerialUSBProtocol):
         self.commands = []
         super().connectionMade()
         self.object["hw_connected"] = 1
+        self.object["status"] = "ok"
 
     @catch
     def connectionLost(self, reason):
         super().connectionLost(self, reason)
         self.object["hw_connected"] = 0
         self.object["status"] = "----"
-        self.object["temperatureA"] = "nan"
-        self.object["temperatureB"] = "nan"
+        for i in range(self.object["n_channels"]):
+            self.object[f"temperature{i}"] = "nan"
 
     @catch
     def processMessage(self, string):
@@ -186,11 +131,14 @@ class GMHProtocol(SerialUSBProtocol):
 
     @catch
     def update(self):
-        if self._debug:
-            print("----------------------- command queue ----------------------------")
-            for k in self.commands:
-                print(k["cmd"], k["source"], k["status"])
-            print("===================== command queue end ==========================")
+        logger.debug(
+            "----------------------- command queue ----------------------------"
+        )
+        for k in self.commands:
+            logger.debug(k["cmd"], k["source"], k["status"])
+        logger.debug(
+            "===================== command queue end =========================="
+        )
 
         if len(self.commands) and obj["hw_connected"]:
             self.message(self.commands[0]["cmd"])
@@ -200,17 +148,19 @@ class GMHProtocol(SerialUSBProtocol):
 
     def processBinary(self, bstring):
         # Process the device reply
+
+        logger.debug("hw bb > %s" % self._bs)
+
+        self.commands.pop(0)
         self._bs = bstring
         result = self.temp_decode(self._bs)
-        if self._debug:
-            print("hw bb > %s" % self._bs)
-            print(f"{result=}")
-        match self._bs[0]:
-            case 254:
-                self.object["temperatureA"] = result
-            case 253:
-                self.object["temperatureB"] = result
-        self.commands.pop(0)
+
+        logger.debug(f"{result=}")
+
+        ch = self._bs[0] - 254
+        if ch < self.n_channels:
+            self.object[f"temperature{ch}"] = result
+            self.object["status"] = "ok"
 
 
 if __name__ == "__main__":
@@ -254,23 +204,38 @@ if __name__ == "__main__":
         action="store_true",
         dest="simulator",
     )
+    parser.add_option(
+        "-c",
+        "--channels",
+        help="Number of channels of connected device",
+        action="store",
+        dest="n_channels",
+        type="int",
+        default=2,
+    )
 
     (options, args) = parser.parse_args()
 
-    # Object holding actual state and work logic.
-    # May be anything that will be passed by reference - list, dict, object etc
-    obj = {"hw_connected": 0, "status": "----", "temperatureA": 0, "temperatureB": 0}
-    # Factories for daemon and hardware connections
-    # We need two different factories as the protocols are different
-    daemon = SimpleFactory(DaemonProtocol, obj)
+    obj = {"hw_connected": 0, "status": "----"}
+    for i in range(options.n_channels):
+        obj[f"temperature{i}"] = 0
+    obj["n_channels"] = options.n_channels
 
+    daemon = SimpleFactory(DaemonProtocol, obj)
     daemon.name = options.name
     obj["daemon"] = daemon
 
-    proto = GMHProtocol(serial_num=options.serial_num, obj=obj, debug=options.debug)
+    proto = GMHProtocol(
+        serial_num=options.serial_num,
+        obj=obj,
+        debug=options.debug,
+    )
     obj["hw"] = proto
     if options.debug:
         daemon._protocol._debug = True
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
 
     if options.simulator:
         daemon._protocol._simulator = True
